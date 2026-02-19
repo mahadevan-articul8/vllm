@@ -938,10 +938,39 @@ def per_token_group_quant_fp8(
         )
         return x_q, x_s
 
-    # TRITON FALLBACK
+    # HPU PyTorch fallback (no Triton support on HPU)
+    if current_platform.device_type == "hpu":
+        # Pure PyTorch implementation for HPU
+        # Reshape into groups
+        x_reshaped = x.view(-1, group_size)
+
+        # Compute absmax per group
+        absmax = torch.max(torch.abs(x_reshaped), dim=1, keepdim=True)[0]
+        absmax = torch.clamp(absmax, min=eps)
+
+        # Compute scale
+        scale = fp8_max / absmax
+
+        # Quantize
+        x_q_reshaped = torch.clamp(x_reshaped * scale, min=fp8_min, max=fp8_max)
+        x_q.copy_(x_q_reshaped.view(x.shape).to(dtype))
+
+        # Store scales
+        if column_major_scales:
+            # Column-major: (num_groups_per_row, num_rows)
+            num_groups_per_row = x.shape[-1] // group_size
+            x_s.copy_(absmax.view(-1, num_groups_per_row).T)
+        else:
+            # Row-major: (num_rows, num_groups_per_row)
+            x_s.copy_(absmax.view(x_s.shape))
+
+        return x_q, x_s
+
+    # TRITON FALLBACK (for non-CUDA, non-HPU platforms)
     M = x.numel() // group_size
     N = group_size
-    BLOCK = triton.next_power_of_2(N)
+    import math
+    BLOCK = 2 ** math.ceil(math.log2(N))  # Avoid triton.next_power_of_2 for dynamo compatibility
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1

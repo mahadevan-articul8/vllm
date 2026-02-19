@@ -47,10 +47,12 @@ def sparse_attn_indexer(
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
-        current_workspace_manager().get_simultaneous(
-            ((total_seq_lens, head_dim), torch.float8_e4m3fn),
-            ((total_seq_lens, 4), torch.uint8),
-        )
+        # Skip workspace reservation on HPU (workspace manager not initialized)
+        if current_platform.device_type != "hpu":
+            current_workspace_manager().get_simultaneous(
+                ((total_seq_lens, head_dim), torch.float8_e4m3fn),
+                ((total_seq_lens, 4), torch.uint8),
+            )
         return sparse_attn_indexer_fake(
             hidden_states,
             k_cache_prefix,
@@ -259,10 +261,12 @@ class SparseAttnIndexer(CustomOp):
             return self.forward_cuda(hidden_states, q_fp8, k, weights)
         elif current_platform.is_rocm():
             return self.forward_hip(hidden_states, q_fp8, k, weights)
+        elif current_platform.device_type == "hpu":
+            return self.forward_hpu(hidden_states, q_fp8, k, weights)
         else:
             raise NotImplementedError(
                 "SparseAttnIndexer native forward is only implemented for "
-                "CUDA and ROCm platform."
+                "CUDA, ROCm, and HPU platforms."
             )
 
     def forward_cuda(
@@ -276,6 +280,37 @@ class SparseAttnIndexer(CustomOp):
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
+            q_fp8,
+            k,
+            weights,
+            self.quant_block_size,
+            self.scale_fmt,
+            self.topk_tokens,
+            self.head_dim,
+            self.max_model_len,
+            self.max_total_seq_len,
+            self.topk_indices_buffer,
+        )
+
+    def forward_hpu(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ):
+        """HPU implementation using PyTorch fallback.
+
+        For now, uses the pure PyTorch implementation defined at module level.
+        Can be optimized with HPU-specific TPC kernels later.
+        """
+        # During profiling/dummy run, KV cache may not be initialized yet
+        kv_cache = self.k_cache.kv_cache[0] if self.k_cache.kv_cache else None
+
+        return sparse_attn_indexer(
+            hidden_states,
+            self.k_cache.prefix,
+            kv_cache,
             q_fp8,
             k,
             weights,
