@@ -878,6 +878,7 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
+    # When SCM version is unavailable (e.g. manual sync), use fallback so the build does not fail.
     version = get_version(write_to="vllm/_version.py", fallback_version="0.0.0")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 

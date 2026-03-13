@@ -877,6 +877,10 @@ def per_token_group_quant_fp8(
     """Function to perform per-token-group quantization on an input tensor `x`.
     It converts the tensor values into signed float8 values and returns the
     quantized tensor along with the scaling factor used for quantization.
+
+    Platform behavior: on CUDA the custom op is used; on HPU (Gaudi) a pure
+    PyTorch fallback is used (no Triton); otherwise the Triton fallback is used.
+
     Args:
         x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.

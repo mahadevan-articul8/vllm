@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Custom Sparse Attention Indexer layers."""
+"""Custom Sparse Attention Indexer layers.
+
+HPU (Gaudi) is supported via a PyTorch fallback path when the workspace/CUDA-
+specific path is not used.
+"""
 
 import torch
 
@@ -224,9 +228,11 @@ class SparseAttnIndexer(CustomOp):
     specific memory layout or implementation for different hardware backends to
     achieve optimal performance.
 
-    For now, the default native path will use CUDA backend path. Other platform
-    may requires add the corresponding Custom Op name `sparse_attn_indexer` to
-    `custom_ops` in `CompilationConfig` to enable the platform specific path.
+    For now, the default native path will use CUDA backend path. On HPU (Gaudi),
+    ``forward_hpu`` uses the module-level PyTorch implementation (no custom
+    kernel). Other platforms may require adding the corresponding Custom Op name
+    ``sparse_attn_indexer`` to ``custom_ops`` in ``CompilationConfig`` to enable
+    the platform-specific path.
     """
 
     def __init__(

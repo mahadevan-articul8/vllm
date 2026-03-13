@@ -675,7 +675,7 @@ class Indexer(nn.Module):
 
         k, _ = self.wk(hidden_states)
         k = self.k_norm(k)
-        k = k.view(-1, self.head_dim)  # Reshape to 2D to match q handling
+        k = k.view(-1, self.head_dim)  # Reshape to 2D so k matches q for RoPE/split (needed for HPU/compilation)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
