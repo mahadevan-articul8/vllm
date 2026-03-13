@@ -1236,8 +1236,8 @@ class ModelConfig:
             if attn_type_list:
                 return sum(t == 1 for t in attn_type_list[start:end])
 
-            # Hybrid model Qwen3Next
-            layer_types_value = getattr(self.hf_config, "layer_types", None)
+            # Hybrid model Qwen3Next / Qwen3.5
+            layer_types_value = getattr(self.hf_text_config, "layer_types", None)
             if layer_types_value is not None:
                 if block_type == "attention":
                     return sum(

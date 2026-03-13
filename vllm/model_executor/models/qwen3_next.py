@@ -40,6 +40,7 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -105,7 +106,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
 
@@ -176,7 +177,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
@@ -291,20 +292,21 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
+        # Qwen3-Next and Qwen3.5 have different qkv_proj layouts,
+        # so we use factory methods to create projections adaptively.
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_qkvz,
-            bias=False,
+        self.in_proj_qkvz = self.create_qkvz_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvz",
         )
         # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_ba,
-            bias=False,
+        self.in_proj_ba = self.create_ba_proj(
+            hidden_size=self.hidden_size,
+            num_v_heads=self.num_v_heads,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
         )
@@ -366,6 +368,51 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        """Factory method for the fused QKV+Z projection.
+
+        Qwen3-Next uses a single output shard (interleaved GQA layout).
+        Qwen3.5 overrides this to use [key_dim, key_dim, value_dim, value_dim]
+        since its checkpoint has separate in_proj_qkv and in_proj_z weights.
+        """
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        """Factory method for the fused B+A projection.
+
+        Qwen3-Next stores in_proj_ba as a single fused weight with an
+        interleaved GQA layout. We use a single output shard so that
+        ColumnParallel sharding preserves this interleaved structure.
+        Qwen3.5 overrides this to use [num_v_heads, num_v_heads] since
+        its checkpoint has separate in_proj_b and in_proj_a weights.
+        """
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[num_v_heads * 2],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
 
     def fix_query_key_value_ordering(
         self,
@@ -807,11 +854,25 @@ class Qwen3NextAttention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        import os as _os_fa, sys as _sys_fa
+        _fa_diag = _os_fa.environ.get("FA_ATTN_DIAG", "0") == "1"
+        if _fa_diag:
+            _fa_idx = getattr(self, '_hpu_fa_idx', '?')
+            _v_flat = v.float()
+            print(f"[FA_ATTN] idx={_fa_idx} q_norm={q.float().norm().item():.4f} k_norm={k.float().norm().item():.4f} v_norm={_v_flat.norm().item():.4f} v_max={_v_flat.abs().max().item():.4f}", flush=True, file=_sys_fa.stderr)
+
         attn_output = self.attn(q, k, v)
+
+        if _fa_diag:
+            print(f"[FA_ATTN] idx={_fa_idx} attn_pre_gate_norm={attn_output.float().norm().item():.4f}", flush=True, file=_sys_fa.stderr)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
+            if _fa_diag:
+                print(f"[FA_ATTN] idx={_fa_idx} gate_mean={gate.float().mean().item():.4f} gate_max={gate.float().max().item():.4f} gate_min={gate.float().min().item():.4f}", flush=True, file=_sys_fa.stderr)
             attn_output = attn_output * gate
+            if _fa_diag:
+                print(f"[FA_ATTN] idx={_fa_idx} attn_post_gate_norm={attn_output.float().norm().item():.4f}", flush=True, file=_sys_fa.stderr)
 
         output[:], _ = self.o_proj(attn_output)
 
@@ -825,7 +886,7 @@ class Qwen3NextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_text_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
@@ -914,6 +975,24 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         self_attention_output = torch.empty_like(hidden_states)
+
+        # --- SAVE INPUT for target layer ---
+        import os as _si_os
+        _save_layer = _si_os.environ.get("SAVE_LAYER_INPUT", "")
+        if _save_layer and hasattr(self, 'layer_idx'):
+            _save_layer_idx = int(_save_layer)
+            if self.layer_idx == _save_layer_idx:
+                _cnt = getattr(self, '_si_save_count', 0)
+                if _cnt < 1:
+                    self._si_save_count = _cnt + 1
+                    _flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                    import torch as _t
+                    _t.save(_flat[0:1].to('cpu').float(), f'/workspace/layer{_save_layer_idx}_input.pt')
+                    import sys as _si_sys
+                    _si_sys.stderr.write(f"[SAVED] Layer {_save_layer_idx} input: shape={_flat[0:1].shape}, norm={_flat[0].float().norm().item():.6f}\n")
+                    _si_sys.stderr.flush()
+        # --- END SAVE INPUT ---
+
         if self.layer_type == "linear_attention":
             self.linear_attn(
                 hidden_states=hidden_states,
@@ -928,6 +1007,26 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+
+        # --- DETAILED LAYER TRACE ---
+        import os as _dlt_os
+        _dlt = _dlt_os.environ.get("LAYER_TRACE", "0") == "1"
+        if _dlt:
+            _dlt_count = getattr(self, '_dlt_count', 0)
+            if _dlt_count < 2:
+                self._dlt_count = _dlt_count + 1
+                import sys as _dlt_sys
+                _h = hidden_states.reshape(-1, hidden_states.shape[-1])
+                _r = residual.reshape(-1, residual.shape[-1]) if residual is not None else None
+                _dlt_sys.stderr.write(
+                    f"  [DLT {self.layer_type}] attn_out: norm={_h[0].float().norm().item():.6f} "
+                    f"first5={_h[0,:5].tolist()}"
+                )
+                if _r is not None:
+                    _dlt_sys.stderr.write(f" | residual: norm={_r[0].float().norm().item():.6f}")
+                _dlt_sys.stderr.write("\n")
+                _dlt_sys.stderr.flush()
+        # --- END DETAILED LAYER TRACE ---
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -965,7 +1064,7 @@ class Qwen3NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config: Qwen3NextConfig = vllm_config.model_config.hf_config
+        config: Qwen3NextConfig = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
 
         eplb_config = parallel_config.eplb_config
@@ -1020,12 +1119,49 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # --- LAYER TRACE ---
+        import os as _lt_os
+        _layer_trace = _lt_os.environ.get("LAYER_TRACE", "0") == "1"
+        _lt_count = getattr(self, '_lt_count', 0)
+        if _layer_trace and _lt_count < 2:
+            self._lt_count = _lt_count + 1
+            import sys as _lt_sys
+            _lt_pass = _lt_count + 1
+            # Print embedding stats at position 0
+            _hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            _lt_sys.stderr.write(
+                f"\n[LAYER_TRACE pass={_lt_pass}] EMBED pos0: "
+                f"norm={_hs_flat[0].float().norm().item():.4f} "
+                f"mean={_hs_flat[0].float().mean().item():.6f} "
+                f"std={_hs_flat[0].float().std().item():.6f} "
+                f"first5={_hs_flat[0,:5].tolist()}\n"
+            )
+            _lt_sys.stderr.flush()
+
+        for _lt_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if _layer_trace and _lt_count < 2:
+                import sys as _lt_sys
+                _hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                _res_flat = residual.reshape(-1, residual.shape[-1]) if residual is not None else None
+                _lt_sys.stderr.write(
+                    f"[LAYER_TRACE pass={_lt_pass}] L{_lt_idx:02d} "
+                    f"hs_norm={_hs_flat[0].float().norm().item():.4f} "
+                    f"hs_mean={_hs_flat[0].float().mean().item():.6f} "
+                    f"hs_first5={_hs_flat[0,:5].tolist()} "
+                )
+                if _res_flat is not None:
+                    _lt_sys.stderr.write(
+                        f"res_norm={_res_flat[0].float().norm().item():.4f} "
+                        f"res_first5={_res_flat[0,:5].tolist()}"
+                    )
+                _lt_sys.stderr.write("\n")
+                _lt_sys.stderr.flush()
+        # --- END LAYER TRACE ---
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
